@@ -64,11 +64,9 @@ void elementary_set_init
  */
 void elementary_set_clean(elementary_set_t *set, service_t *t, int keep_nicename)
 {
-  elementary_stream_t *st;
-
   TAILQ_INIT(&set->set_filter);
-  while ((st = TAILQ_FIRST(&set->set_all)) != NULL)
-    elementary_set_stream_destroy(set, st);
+  while (!TAILQ_EMPTY(&set->set_all))
+    elementary_set_stream_destroy(set, TAILQ_FIRST(&set->set_all));
   if (!keep_nicename) {
     free(set->set_nicename);
     set->set_nicename = NULL;
@@ -458,14 +456,11 @@ elementary_stream_create_parent
   TAILQ_FOREACH(st, &set->set_all, es_link) {
     if(st->es_index > idx)
       idx = st->es_index;
-    if(pid != -1 && st->es_pid == pid) {
-      if (parent_pid >= 0 && st->es_parent_pid != parent_pid)
-        goto create;
+    if(pid != -1 && st->es_pid == pid &&
+       (parent_pid < 0 || st->es_parent_pid == parent_pid))
       return st;
-    }
   }
 
-create:
   st = calloc(1, sizeof(elementary_stream_t));
   st->es_index = idx + 1;
 

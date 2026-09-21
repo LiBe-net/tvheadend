@@ -80,11 +80,14 @@ void elementary_set_clean(elementary_set_t *set, service_t *t, int keep_nicename
 void elementary_set_update_nicename(elementary_set_t *set, const char *nicename)
 {
   elementary_stream_t *st;
+  char *new_nicename;
+
+  new_nicename = nicename ? strdup(nicename) : NULL;
 
   free(set->set_nicename);
-  set->set_nicename = nicename ? strdup(nicename) : NULL;
+  set->set_nicename = new_nicename;
   TAILQ_FOREACH(st, &set->set_all, es_link)
-    elementary_stream_make_nicename(st, nicename);
+    elementary_stream_make_nicename(st, new_nicename);
 }
 
 /**

@@ -97,6 +97,73 @@ timeshift_size_used ( void )
   return size;
 }
 
+uint64_t
+timeshift_ram_used ( void )
+{
+  return atomic_get_u64(&timeshift_total_ram_size);
+}
+
+
+/*
+ * Reserve retained Timeshift RAM.
+ *
+ * Classic Timeshift still updates this counter through the existing
+ * atomic helpers.  CAS therefore makes the check + reservation atomic
+ * with respect to those updates as well.
+ */
+int
+timeshift_ram_reserve ( uint64_t size )
+{
+  uint64_t used;
+  const uint64_t limit = timeshift_conf.ram_size;
+
+  if (size == 0)
+    return 1;
+
+  if (limit == 0 || size > limit)
+    return 0;
+
+#if ENABLE_ATOMIC64
+
+  for (;;) {
+    used = atomic_get_u64(&timeshift_total_ram_size);
+
+    if (used > limit - size)
+      return 0;
+
+    if (__sync_bool_compare_and_swap
+          (&timeshift_total_ram_size, used, used + size))
+      return 1;
+  }
+
+#else
+
+  tvh_mutex_lock(&atomic_lock);
+
+  used = timeshift_total_ram_size;
+
+  if (used > limit - size) {
+    tvh_mutex_unlock(&atomic_lock);
+    return 0;
+  }
+
+  timeshift_total_ram_size = used + size;
+
+  tvh_mutex_unlock(&atomic_lock);
+  return 1;
+
+#endif
+}
+
+
+void
+timeshift_ram_release ( uint64_t size )
+{
+  if (size)
+    atomic_dec_u64(&timeshift_total_ram_size, size);
+}
+
+
 /* **************************************************************************
  * File reaper thread
  * *************************************************************************/

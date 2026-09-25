@@ -157,6 +157,10 @@ uint64_t timeshift_size_used ( void );
 int timeshift_size_reserve ( uint64_t size );
 void timeshift_size_release ( uint64_t size );
 
+uint64_t timeshift_ram_used ( void );
+int timeshift_ram_reserve ( uint64_t size );
+void timeshift_ram_release ( uint64_t size );
+
 void timeshift_packet_log0
   ( const char *prefix, timeshift_t *ts, streaming_message_t *sm );
 

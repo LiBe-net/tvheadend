@@ -35,6 +35,68 @@ static tvh_cond_t            timeshift_reaper_cond;
 uint64_t                     timeshift_total_size;
 uint64_t                     timeshift_total_ram_size;
 
+static tvh_mutex_t            timeshift_size_lock =
+  TVH_THREAD_MUTEX_INITIALIZER;
+
+/*
+ * Reserve logical timeshift storage before writing it.  RAM-only always
+ * remains bounded by the configured RAM size; otherwise unlimited_size
+ * is the only way to disable the combined size limit.
+ */
+int
+timeshift_size_reserve ( uint64_t size )
+{
+  uint64_t limit;
+  int unlimited;
+  int ok = 0;
+
+  if (size == 0)
+    return 1;
+
+  tvh_mutex_lock(&timeshift_size_lock);
+
+  if (timeshift_conf.ram_only) {
+    limit = timeshift_conf.ram_size;
+    unlimited = 0;
+  } else {
+    limit = timeshift_conf.max_size;
+    unlimited = timeshift_conf.unlimited_size;
+  }
+
+  if (unlimited ||
+      (size <= limit && timeshift_total_size <= limit - size)) {
+    timeshift_total_size += size;
+    ok = 1;
+  }
+
+  tvh_mutex_unlock(&timeshift_size_lock);
+  return ok;
+}
+
+void
+timeshift_size_release ( uint64_t size )
+{
+  if (size == 0)
+    return;
+
+  tvh_mutex_lock(&timeshift_size_lock);
+  assert(timeshift_total_size >= size);
+  timeshift_total_size -= size;
+  tvh_mutex_unlock(&timeshift_size_lock);
+}
+
+uint64_t
+timeshift_size_used ( void )
+{
+  uint64_t size;
+
+  tvh_mutex_lock(&timeshift_size_lock);
+  size = timeshift_total_size;
+  tvh_mutex_unlock(&timeshift_size_lock);
+
+  return size;
+}
+
 /* **************************************************************************
  * File reaper thread
  * *************************************************************************/
@@ -166,12 +228,10 @@ void timeshift_filemgr_close ( timeshift_file_t *tsf )
 {
   uint8_t *ram;
   ssize_t r = timeshift_write_eof(tsf);
-  if (r > 0) {
-    tsf->size += r;
-    atomic_add_u64(&timeshift_total_size, r);
-    if (tsf->ram)
-      atomic_add_u64(&timeshift_total_ram_size, r);
-  }
+  if (r < 0)
+    tvhwarn(LS_TIMESHIFT,
+            "unable to write timeshift EOF marker: %s",
+            strerror(errno));
   if (tsf->ram) {
     /* maintain unused memory block */
     ram = realloc(tsf->ram, tsf->woff);
@@ -210,7 +270,7 @@ void timeshift_filemgr_remove
     assert(ts->ram_segments > 0);
     ts->ram_segments--;
   }
-  atomic_dec_u64(&timeshift_total_size, tsf->size);
+  timeshift_size_release(tsf->size);
   if (tsf->ram)
     atomic_dec_u64(&timeshift_total_ram_size, tsf->size);
   timeshift_reaper_remove(tsf);
@@ -238,6 +298,7 @@ static timeshift_file_t * timeshift_filemgr_file_init
 
   tsf = calloc(1, sizeof(timeshift_file_t));
   memoryinfo_alloc(&timeshift_memoryinfo, sizeof(*tsf));
+  tsf->owner    = ts;
   tsf->time     = mono2sec(start_time) / TIMESHIFT_FILE_PERIOD;
   tsf->last     = start_time;
   tsf->wfd      = -1;
@@ -297,7 +358,7 @@ timeshift_file_t *timeshift_filemgr_get ( timeshift_t *ts, int64_t start_time )
 
     /* Check size */
     if (!timeshift_conf.unlimited_size &&
-        atomic_pre_add_u64(&timeshift_conf.total_size, 0) >= timeshift_conf.max_size) {
+        timeshift_size_used() >= timeshift_conf.max_size) {
 
       /* Remove the last file (if we can) */
       if (tsf_hd && !tsf_hd->refcount) {

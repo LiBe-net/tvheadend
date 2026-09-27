@@ -158,6 +158,7 @@ int timeshift_size_reserve ( uint64_t size );
 void timeshift_size_release ( uint64_t size );
 
 uint64_t timeshift_ram_used ( void );
+int timeshift_ram_system_available ( uint64_t size );
 int timeshift_ram_reserve ( uint64_t size );
 void timeshift_ram_release ( uint64_t size );
 

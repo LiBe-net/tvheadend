@@ -34,6 +34,7 @@ typedef struct timeshift_conf {
   uint64_t  max_size;
   uint64_t  ram_size;
   uint64_t  ram_segment_size;
+  uint32_t  ram_min_available_pct;
   uint64_t  total_ram_size;
   int       ram_only;
   int       ram_fit;

@@ -17,6 +17,7 @@
  */
 
 #include <fcntl.h>
+#include <stdio.h>
 
 #include "tvheadend.h"
 #include "streaming.h"
@@ -37,6 +38,22 @@ uint64_t                     timeshift_total_ram_size;
 
 static tvh_mutex_t            timeshift_size_lock =
   TVH_THREAD_MUTEX_INITIALIZER;
+
+/*
+ * Keep a fixed part of host memory available for the rest of the system.
+ *
+ * This is an admission limit, not a target: retained Timeshift RAM is
+ * never grown when doing so would leave less than this percentage of
+ * MemAvailable. Existing RAM history is left alone and expires through
+ * the normal Timeshift retention rules.
+ */
+
+static tvh_mutex_t timeshift_ram_meminfo_lock =
+  TVH_THREAD_MUTEX_INITIALIZER;
+static int64_t  timeshift_ram_meminfo_mono;
+static uint64_t timeshift_ram_meminfo_total;
+static uint64_t timeshift_ram_meminfo_available;
+static int      timeshift_ram_meminfo_valid;
 
 /*
  * Reserve logical timeshift storage before writing it.  RAM-only always
@@ -105,6 +122,106 @@ timeshift_ram_used ( void )
 
 
 /*
+ * Check whether growing retained Timeshift RAM by reserve bytes would
+ * leave the host with at least the configured percentage of
+ * MemAvailable.
+ *
+ * /proc/meminfo is deliberately sampled only four times per second.
+ * The fast path therefore adds only a mutex and a few integer operations
+ * to RAM admission while still reacting quickly compared with a
+ * Timeshift block/segment lifetime.
+ *
+ * If MemAvailable cannot be read, retain the traditional configured-RAM
+ * behaviour rather than disabling Timeshift RAM altogether.
+ */
+int
+timeshift_ram_system_available ( uint64_t reserve )
+{
+#ifdef __linux__
+  FILE *fp;
+  char line[256];
+  unsigned long long kb;
+  uint64_t total = 0, available = 0, floor;
+  uint32_t pct = timeshift_conf.ram_min_available_pct;
+  int have_total = 0, have_available = 0;
+  int valid;
+  int64_t now;
+
+  if (pct == 0)
+    return 1;
+
+  now = mclk();
+
+  tvh_mutex_lock(&timeshift_ram_meminfo_lock);
+
+  if (timeshift_ram_meminfo_mono == 0 ||
+      now - timeshift_ram_meminfo_mono >= sec2mono(1) / 4) {
+
+    fp = fopen("/proc/meminfo", "r");
+    if (fp != NULL) {
+      while (fgets(line, sizeof(line), fp) != NULL) {
+        if (!have_total &&
+            sscanf(line, "MemTotal: %llu kB", &kb) == 1) {
+          total = (uint64_t)kb * 1024ULL;
+          have_total = 1;
+        } else if (!have_available &&
+                   sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
+          available = (uint64_t)kb * 1024ULL;
+          have_available = 1;
+        }
+
+        if (have_total && have_available)
+          break;
+      }
+      fclose(fp);
+    }
+
+    timeshift_ram_meminfo_mono = now;
+
+    if (have_total && have_available && total != 0) {
+      timeshift_ram_meminfo_total = total;
+      timeshift_ram_meminfo_available = available;
+      timeshift_ram_meminfo_valid = 1;
+    } else {
+      timeshift_ram_meminfo_valid = 0;
+    }
+  }
+
+  valid = timeshift_ram_meminfo_valid;
+  if (valid) {
+    total = timeshift_ram_meminfo_total;
+    available = timeshift_ram_meminfo_available;
+  }
+
+  tvh_mutex_unlock(&timeshift_ram_meminfo_lock);
+
+  if (!valid || total == 0)
+    return 1;
+
+  /*
+   * Avoid total * percentage so even theoretically huge values cannot
+   * overflow uint64_t.
+   */
+  floor =
+    (total / 100) * pct +
+    ((total % 100) * pct) / 100;
+
+  if (available <= floor)
+    return 0;
+
+  /*
+   * Do not merely test the current value: the requested growth itself
+   * must still leave the configured system reserve intact.
+   */
+  return reserve <= available - floor;
+#else
+  (void)reserve;
+  return 1;
+#endif
+}
+
+
+/*
  * Reserve retained Timeshift RAM.
  *
  * Classic Timeshift still updates this counter through the existing
@@ -121,6 +238,16 @@ timeshift_ram_reserve ( uint64_t size )
     return 1;
 
   if (limit == 0 || size > limit)
+    return 0;
+
+  /*
+   * The configured RAM size is a ceiling, not a reservation. Stop
+   * growing retained RAM when the configured host-memory headroom is
+   * reached.
+   * Shared svcbuf will seal its current RAM block and put the next block
+   * on storage when RAM-only mode is disabled.
+   */
+  if (!timeshift_ram_system_available(size))
     return 0;
 
 #if ENABLE_ATOMIC64
@@ -388,6 +515,8 @@ timeshift_file_t *timeshift_filemgr_get ( timeshift_t *ts, int64_t start_time )
   streaming_message_t *sm;
   char path[PATH_MAX];
   int64_t time;
+  uint64_t ram_alloc;
+  int ram_limit_ok;
 
   /* Return last file */
   if (start_time < 0)
@@ -401,7 +530,9 @@ timeshift_file_t *timeshift_filemgr_get ( timeshift_t *ts, int64_t start_time )
   tsf_tl = TAILQ_LAST(&ts->files, timeshift_file_list);
   time = mono2sec(start_time) / TIMESHIFT_FILE_PERIOD;
   if (!tsf_tl || tsf_tl->time < time ||
-      (tsf_tl->ram && tsf_tl->woff >= timeshift_conf.ram_segment_size)) {
+      (tsf_tl->ram &&
+       (tsf_tl->woff >= timeshift_conf.ram_segment_size ||
+        !timeshift_ram_system_available(1)))) {
     tsf_hd = TAILQ_FIRST(&ts->files);
 
     /* Close existing */
@@ -450,12 +581,27 @@ timeshift_file_t *timeshift_filemgr_get ( timeshift_t *ts, int64_t start_time )
       tvhtrace(LS_TIMESHIFT, "ts %d RAM total %"PRId64" requested %"PRId64" segment %"PRId64,
                    ts->id, atomic_pre_add_u64(&timeshift_total_ram_size, 0),
                    timeshift_conf.ram_size, timeshift_conf.ram_segment_size);
+      ram_alloc =
+        MIN(16*1024*1024, timeshift_conf.ram_segment_size);
+
       while (1) {
-        if (timeshift_conf.ram_size >= 8*1024*1024 &&
-            atomic_pre_add_u64(&timeshift_total_ram_size, 0) <
-              timeshift_conf.ram_size + (timeshift_conf.ram_segment_size / 2)) {
+        ram_limit_ok =
+          timeshift_conf.ram_size >= 8*1024*1024 &&
+          atomic_pre_add_u64(&timeshift_total_ram_size, 0) <
+            timeshift_conf.ram_size +
+              (timeshift_conf.ram_segment_size / 2);
+
+        if (ram_limit_ok) {
+          /*
+           * Do not evict existing RAM history merely because another
+           * host service needs memory. Leave that history to normal
+           * retention and put this new segment on disk instead.
+           */
+          if (!timeshift_ram_system_available(ram_alloc))
+            break;
+
           tsf_tmp = timeshift_filemgr_file_init(ts, start_time);
-          tsf_tmp->ram_size = MIN(16*1024*1024, timeshift_conf.ram_segment_size);
+          tsf_tmp->ram_size = ram_alloc;
           tsf_tmp->ram = malloc(tsf_tmp->ram_size);
           if (!tsf_tmp->ram) {
             free(tsf_tmp);

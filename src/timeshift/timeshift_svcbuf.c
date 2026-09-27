@@ -721,7 +721,23 @@ svcbuf_input ( void *opaque, streaming_message_t *sm )
        * became available in the meantime.
        */
       if (b == NULL) {
-        if (!ram_reserved)
+        alloc = MAX(len, SVCBUF_BLOCK_SIZE);
+
+        /*
+         * Choose retained RAM only when both limits allow this new block:
+         *
+         *   - Maximum RAM size
+         *   - minimum host MemAvailable headroom
+         *
+         * Existing RAM blocks are neither migrated nor discarded because
+         * of host memory pressure. They expire through normal retention.
+         *
+         * svcbuf_block_new() allocates the complete block up front, so
+         * check host headroom against the allocation rather than only the
+         * first MPEG-TS payload.
+         */
+        if (!ram_reserved &&
+            timeshift_ram_system_available(alloc))
           ram_reserved = timeshift_ram_reserve(len);
 
         keep_ram = ram_reserved;
@@ -746,8 +762,6 @@ svcbuf_input ( void *opaque, streaming_message_t *sm )
          * share one bounded backlog instead of each hitting a tiny
          * per-service block-count limit.
          */
-        alloc = MAX(len, SVCBUF_BLOCK_SIZE);
-
         if (!keep_ram) {
           if (!svcbuf_staging_reserve(alloc)) {
             timeshift_size_release(len);

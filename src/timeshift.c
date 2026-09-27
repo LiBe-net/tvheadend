@@ -81,6 +81,9 @@ static void timeshift_fixup ( void )
 {
   if (timeshift_conf.ram_only)
     timeshift_conf.max_size = timeshift_conf.ram_size;
+
+  if (timeshift_conf.ram_min_available_pct > 90)
+    timeshift_conf.ram_min_available_pct = 90;
 }
 
 /*
@@ -102,6 +105,7 @@ void timeshift_init ( void )
   timeshift_conf.cache_keepalive            = 15;
   timeshift_conf.cache_keepalive_min_period = 60;
   timeshift_conf.cache_keepalive_max        = 4;
+  timeshift_conf.ram_min_available_pct      = 10;
   timeshift_conf.max_size                   = 10000 * (size_t)1048576; // 10G
 
   idclass_register(&timeshift_conf_class);
@@ -266,12 +270,26 @@ const idclass_t timeshift_conf_class = {
       .id     = "ram_size",
       .name   = N_("Maximum RAM size (MB)"),
       .desc   = N_("The maximum RAM (system memory) size for timeshift "
-                   "buffers. When free RAM buffers are available they "
-                   "are used for timeshift data in preference to using "
-                   "storage."),
+                   "buffers. This is an upper limit, not a reservation. "
+                   "When RAM is available it is preferred over storage."),
       .set    = timeshift_conf_class_ram_size_set,
       .get    = timeshift_conf_class_ram_size_get,
       .opts   = PO_ADVANCED,
+    },
+    {
+      .type     = PT_U32,
+      .id       = "ram_min_available_pct",
+      .name     = N_("Minimum free system RAM (%)"),
+      .desc     = N_("Do not retain new timeshift data in RAM when doing "
+                     "so would reduce available system memory below this "
+                     "percentage. When disk storage is enabled, new "
+                     "timeshift blocks or segments use storage instead. "
+                     "Existing RAM history is not moved or discarded and "
+                     "expires normally. Zero disables this safeguard."),
+      .off      = offsetof(timeshift_conf_t, ram_min_available_pct),
+      .intextra = INTEXTRA_RANGE(0, 90, 1),
+      .def.u32  = 10,
+      .opts     = PO_ADVANCED,
     },
     {
       .type   = PT_BOOL,

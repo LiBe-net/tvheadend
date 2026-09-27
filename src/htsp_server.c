@@ -385,6 +385,157 @@ htsp_image(htsp_connection_t *htsp, const char *image,
   return ret;
 }
 
+#if ENABLE_TIMESHIFT
+
+/*
+ * Return this HTSP subscription's current shared-timeshift playhead as
+ * wall-clock time.
+ *
+ * A positive shift means playback is behind live.  A zero/negative shift
+ * means the viewer is at the live edge, whose wall-clock position is now.
+ * Status older than five seconds is not trusted.
+ */
+static int
+htsp_cache_playhead ( htsp_subscription_t *hs, time_t *when )
+{
+  int64_t shift_us;
+
+  if (hs->hs_prch.prch_svcts == NULL ||
+      hs->hs_s == NULL ||
+      hs->hs_s->ths_channel == NULL)
+    return 0;
+
+  if (hs->hs_timeshift_status_mono == 0 ||
+      mclk() - hs->hs_timeshift_status_mono > sec2mono(5))
+    return 0;
+
+  shift_us = ts_rescale(hs->hs_timeshift_shift, 1000000);
+
+  if (shift_us > 0)
+    *when = gclk() - (time_t)(shift_us / 1000000);
+  else
+    *when = gclk();
+
+  return 1;
+}
+
+/*
+ * addDvrEntry has no subscriptionId.  Only use a playback subscription
+ * for the initial resume position when exactly one fresh subscription on
+ * this HTSP connection is playing the DVR entry's channel.
+ */
+static htsp_subscription_t *
+htsp_cache_unique_playback
+  ( htsp_connection_t *htsp, channel_t *ch )
+{
+  htsp_subscription_t *hs, *found = NULL;
+  time_t when;
+
+  LIST_FOREACH(hs, &htsp->htsp_subscriptions, hs_link) {
+    if (hs->hs_s == NULL ||
+        hs->hs_s->ths_channel != ch ||
+        !htsp_cache_playhead(hs, &when))
+      continue;
+
+    if (found != NULL)
+      return NULL;
+
+    found = hs;
+  }
+
+  return found;
+}
+
+/*
+ * Preserve the viewer's position inside a cache-backed recording.
+ *
+ * Prefer the actual first recording-file timestamp because the retained
+ * cache may not reach the scheduled programme start.  This is also what
+ * makes our full-cache Record semantics work: the viewer may deliberately
+ * be positioned in an older programme while the DVR entry represents the
+ * currently airing programme.
+ */
+static void
+htsp_cache_record_position
+  ( htsp_connection_t *htsp, htsp_subscription_t *hs, dvr_entry_t *only )
+{
+  dvr_entry_t *de;
+  channel_t *ch;
+  time_t when, start, file_start, file_stop;
+  int filecount;
+  uint32_t pos;
+
+  lock_assert(&global_lock);
+
+  if (!htsp_cache_playhead(hs, &when))
+    return;
+
+  ch = hs->hs_s->ths_channel;
+  if (ch == NULL)
+    return;
+
+  LIST_FOREACH(de, &ch->ch_dvrs, de_channel_link) {
+    if (only && de != only)
+      continue;
+
+    if (!only && de->de_sched_state != DVR_RECORDING)
+      continue;
+
+    if (de->de_cache_only)
+      continue;
+
+    /*
+     * A viewer cannot have reached data after this DVR entry's recording
+     * window.  The lower bound is deliberately determined below from the
+     * actual file start, not merely from the current EPG event.
+     */
+    if (when > dvr_entry_get_stop_time(de))
+      continue;
+
+    start = dvr_entry_get_start_time(de, 0);
+
+    file_start = 0;
+    file_stop  = 0;
+    filecount  = 0;
+
+    /*
+     * dvr_get_files_details() returns the earliest file start even when a
+     * recording was split into several files by a stream reconfiguration.
+     * That is preferable to rejecting multi-file recordings outright.
+     */
+    if (!dvr_get_files_details(de, &file_start, &file_stop, &filecount) &&
+        file_start > 0 &&
+        file_start <= when)
+      start = file_start;
+
+    /*
+     * For a newly-created full-cache recording its file metadata may not
+     * exist yet.  Do not invent a position relative to the current EPG
+     * start when the viewer is actually further back in history.  The
+     * position will be updated once the viewer leaves and file_start is
+     * available.
+     */
+    if (when < start)
+      continue;
+
+    pos = (uint32_t)(when - start);
+
+    if (de->de_playposition == pos)
+      continue;
+
+    de->de_playposition = pos;
+    dvr_entry_changed(de);
+
+    tvhdebug(LS_HTSP,
+             "%s: play position of \"%s\" set to %u s",
+             htsp->htsp_logname,
+             lang_str_get(de->de_title, NULL) ?: "",
+             pos);
+  }
+}
+
+#endif /* ENABLE_TIMESHIFT */
+
 /**
  *
  */
@@ -392,6 +543,14 @@ static void
 htsp_subscription_destroy(htsp_connection_t *htsp, htsp_subscription_t *hs)
 {
   th_subscription_t *ts = hs->hs_s;
+
+#if ENABLE_TIMESHIFT
+  /*
+   * The viewer is leaving. Preserve its exact position in any recording
+   * on this channel which contains that playhead.
+   */
+  htsp_cache_record_position(htsp, hs, NULL);
+#endif
 
   hs->hs_s = NULL;
   mtimer_disarm(&hs->hs_s_bytes_out_timer);
@@ -2182,6 +2341,7 @@ htsp_method_addDvrEntry(htsp_connection_t *htsp, htsmsg_t *in)
   channel_t *ch = NULL;
 #if ENABLE_TIMESHIFT
   int cache_full = 0;
+  htsp_subscription_t *record_hs = NULL;
 #endif
 
   {
@@ -2321,6 +2481,22 @@ htsp_method_addDvrEntry(htsp_connection_t *htsp, htsmsg_t *in)
     tvhinfo(LS_HTSP,
             "%s: addDvrEntry: DVR entry created, state=%d",
             htsp->htsp_logname, (int)de->de_sched_state);
+
+#if ENABLE_TIMESHIFT
+  /*
+   * Initialise the resume point only when this HTSP connection has one
+   * unambiguous playback subscription for the recorded channel.
+   *
+   * A full-cache recording whose viewer is still in an older programme
+   * may not have its real file start yet; in that case the helper waits
+   * for the later disconnect update rather than storing a wrong offset.
+   */
+  if (de != NULL) {
+    record_hs = htsp_cache_unique_playback(htsp, de->de_channel);
+    if (record_hs != NULL)
+      htsp_cache_record_position(htsp, record_hs, de);
+  }
+#endif
 
   dvr_status = de != NULL ? de->de_sched_state : DVR_NOSTATE;
 

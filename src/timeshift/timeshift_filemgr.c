@@ -554,12 +554,21 @@ timeshift_file_t *timeshift_filemgr_get ( timeshift_t *ts, int64_t start_time )
       }
     }
 
-    /* Check size */
-    if (!timeshift_conf.unlimited_size &&
-        timeshift_size_used() >= timeshift_conf.max_size) {
+    /*
+     * Check the combined Classic + shared Timeshift size.
+     * RAM-only buffers are bounded by the RAM checks below.
+     */
+    while (!ts->full && !timeshift_conf.ram_only &&
+           !timeshift_conf.unlimited_size &&
+           timeshift_size_used() >= timeshift_conf.max_size) {
 
-      /* Remove the last file (if we can) */
-      if (tsf_hd && !tsf_hd->refcount) {
+      /*
+       * The period check above may already have removed the old head.
+       * Re-read it, and never remove the current tail: its START message
+       * is still needed when the new file is created below.
+       */
+      tsf_hd = TAILQ_FIRST(&ts->files);
+      if (tsf_hd && tsf_hd != tsf_tl && !tsf_hd->refcount) {
         timeshift_filemgr_remove(ts, tsf_hd, 0);
 
       /* Full */
@@ -610,8 +619,9 @@ timeshift_file_t *timeshift_filemgr_get ( timeshift_t *ts, int64_t start_time )
           break;
         } else {
           tsf_hd = TAILQ_FIRST(&ts->files);
-          if (timeshift_conf.ram_fit && tsf_hd && !tsf_hd->refcount &&
-              tsf_hd->ram && ts->file_segments == 0) {
+          if (timeshift_conf.ram_fit && tsf_hd && tsf_hd != tsf_tl &&
+              !tsf_hd->refcount && tsf_hd->ram &&
+              ts->file_segments == 0) {
             tvhtrace(LS_TIMESHIFT, "ts %d remove RAM segment %"PRId64" (fit)", ts->id, tsf_hd->time);
             timeshift_filemgr_remove(ts, tsf_hd, 0);
           } else {

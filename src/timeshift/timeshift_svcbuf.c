@@ -156,8 +156,8 @@ struct svcbuf_gate {
   time_t               from;
   time_t               to;      ///< Historical end; 0 means catch up to live
   int                  all;     ///< Begin at oldest available block
-  int                  state;   ///< Changed under s_stream_mutex
-  int                 *replaying; ///< Mirrors state == GATE_REPLAY
+  int                  state;   ///< Gate state, accessed atomically
+  int                 *replaying; ///< Atomic mirror of state == GATE_REPLAY
   time_t              *replay_start; ///< Set to where the replay begins
   streaming_queue_t   *sq;      ///< Consumer queue to pace on, or NULL
   svcbuf_block_t      *blk;     ///< Replay position, pins it (sb->lock)
@@ -413,7 +413,7 @@ svcbuf_mark_replays_no_space_locked ( svcbuf_t *sb )
   int n = 0;
 
   LIST_FOREACH(g, &sb->gates, link) {
-    if (g->state == GATE_REPLAY && g->blk != NULL) {
+    if (atomic_get(&g->state) == GATE_REPLAY && g->blk != NULL) {
       g->no_space = 1;
       n++;
     }
@@ -962,8 +962,8 @@ svcbuf_release ( svcbuf_t *sb )
 static void
 svcbuf_gate_set_state ( svcbuf_gate_t *g, int state )
 {
-  g->state = state;
-  *g->replaying = state == GATE_REPLAY;
+  atomic_set(&g->state, state);
+  atomic_set(g->replaying, state == GATE_REPLAY);
 }
 
 /* s_stream_mutex held; ownership of ss is transferred to the message. */
@@ -1027,7 +1027,7 @@ svcbuf_gate_sync_live_start ( svcbuf_gate_t *g )
 static void
 svcbuf_gate_finish_history ( svcbuf_gate_t *g, int code )
 {
-  if (g->state != GATE_REPLAY && g->state != GATE_WAIT)
+  if (atomic_get(&g->state) != GATE_REPLAY && atomic_get(&g->state) != GATE_WAIT)
     return;
 
   svcbuf_gate_set_state(g, GATE_DONE);
@@ -1052,12 +1052,12 @@ svcbuf_gate_thread ( void *aux )
 
   tvh_mutex_lock(&sb->lock);
 
-  while (g->state == GATE_REPLAY) {
+  while (atomic_get(&g->state) == GATE_REPLAY) {
     if (g->no_space) {
       tvh_mutex_unlock(&sb->lock);
       tvh_mutex_lock(&t->s_stream_mutex);
 
-      if (g->state == GATE_REPLAY) {
+      if (atomic_get(&g->state) == GATE_REPLAY) {
         tvherror(LS_TIMESHIFT,
                  "svcbuf: %s: stopping cache replay because the "
                  "timeshift size limit was reached",
@@ -1095,7 +1095,7 @@ svcbuf_gate_thread ( void *aux )
       tvh_mutex_unlock(&sb->lock);
       tvh_mutex_lock(&t->s_stream_mutex);
 
-      if (g->state == GATE_REPLAY)
+      if (atomic_get(&g->state) == GATE_REPLAY)
         svcbuf_gate_finish_history(g, SM_CODE_OK);
 
       tvh_mutex_unlock(&t->s_stream_mutex);
@@ -1117,7 +1117,7 @@ svcbuf_gate_thread ( void *aux )
       tvh_mutex_unlock(&sb->lock);
       tvh_mutex_lock(&t->s_stream_mutex);
 
-      if (g->state == GATE_REPLAY)
+      if (atomic_get(&g->state) == GATE_REPLAY)
         svcbuf_gate_deliver_start(g, ss, start_seq, 1, 1);
       else if (ss)
         streaming_start_unref(ss);
@@ -1155,7 +1155,7 @@ svcbuf_gate_thread ( void *aux )
       tvh_mutex_unlock(&sb->lock);
       tvh_mutex_lock(&t->s_stream_mutex);
 
-      if (g->state == GATE_REPLAY) {
+      if (atomic_get(&g->state) == GATE_REPLAY) {
         streaming_target_deliver2
           (g->output, streaming_msg_create_data(SMT_MPEGTS, pb));
 
@@ -1185,7 +1185,7 @@ svcbuf_gate_thread ( void *aux )
       tvh_mutex_unlock(&sb->lock);
       tvh_mutex_lock(&t->s_stream_mutex);
 
-      if (g->state == GATE_REPLAY) {
+      if (atomic_get(&g->state) == GATE_REPLAY) {
         tvhinfo(LS_TIMESHIFT,
                 "svcbuf: %s: retrospective replay reached stop boundary "
                 "%"PRItime_t,
@@ -1216,7 +1216,7 @@ svcbuf_gate_thread ( void *aux )
         g->off == g->blk->size) {
       tvh_mutex_unlock(&sb->lock);
 
-      if (g->state == GATE_REPLAY) {
+      if (atomic_get(&g->state) == GATE_REPLAY) {
         if (g->to && !(g->all && g->to > gclk())) {
           /*
            * A bounded historical recording is best-effort.  If the
@@ -1245,11 +1245,11 @@ svcbuf_gate_thread ( void *aux )
     tvh_mutex_unlock(&t->s_stream_mutex);
   }
 
-  if (!live && g->state == GATE_REPLAY) {
+  if (!live && atomic_get(&g->state) == GATE_REPLAY) {
     tvh_mutex_unlock(&sb->lock);
     tvh_mutex_lock(&t->s_stream_mutex);
 
-    if (g->state == GATE_REPLAY) {
+    if (atomic_get(&g->state) == GATE_REPLAY) {
       if (g->to && !(g->all && g->to > gclk()))
         svcbuf_gate_finish_history(g, SM_CODE_NO_INPUT);
       else {
@@ -1385,7 +1385,7 @@ svcbuf_gate_input ( void *opaque, streaming_message_t *sm )
 {
   svcbuf_gate_t *g = opaque;
 
-  switch (g->state) {
+  switch (atomic_get(&g->state)) {
   case GATE_WAIT:
     if (sm->sm_type == SMT_MPEGTS) {
       streaming_msg_free(sm);
@@ -1473,8 +1473,9 @@ svcbuf_gate_create ( service_t *t, time_t from, time_t to, int all,
   g->from   = from;
   g->to     = to;
   g->all    = all;
-  g->state  = GATE_WAIT;
   g->replaying = replaying;
+  atomic_set(&g->state, GATE_WAIT);
+  atomic_set(g->replaying, 0);
   g->replay_start = replay_start;
   g->sq     = sq;
   g->sb     = sb;

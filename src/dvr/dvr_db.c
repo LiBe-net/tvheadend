@@ -3542,7 +3542,8 @@ dvr_timer_stop_recording(void *aux)
    * exact historical stop boundary, so keep the subscription alive until
    * the gate reaches it.
    */
-  if (de->de_cache_full && de->de_s && de->de_s->ths_replaying) {
+  if (de->de_cache_full && de->de_s &&
+      atomic_get(&de->de_s->ths_replaying)) {
     dvr_entry_trace(de,
                     "full-cache replay active at DVR stop; "
                     "waiting for cache stop boundary");
